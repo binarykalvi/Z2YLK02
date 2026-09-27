@@ -5,7 +5,7 @@ on:
     types: [Z2YLK02]
 
 jobs:
-  DAU:
+  Z2YLK02:
     runs-on: ubuntu-latest
 
     steps:
@@ -20,19 +20,28 @@ jobs:
       - name: Install
         run: npm install
 
-      - name: Get Zoom Recording
+      - name: Find Zoom Cloud Recordings
         env:
           ZOOM_ACCOUNT_ID: ${{ secrets.ZOOM_ACCOUNT_ID }}
           ZOOM_CLIENT_ID: ${{ secrets.ZOOM_CLIENT_ID }}
           ZOOM_CLIENT_SECRET: ${{ secrets.ZOOM_CLIENT_SECRET }}
-          ZOOM_WEBINAR_ID: ${{ github.event.client_payload.webinar_id }}
-          ZOOM_URL: ${{ github.event.client_payload.zoom_url }}
         run: node zoom.js
 
-      - name: Download Zoom Recording
+      - name: Check Recordings
+        id: recordings
+        run: |
+          if [ -s urls.txt ]; then
+            echo "found=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "found=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Download Zoom Recordings
+        if: steps.recordings.outputs.found == 'true'
         run: npx --yes zoom-rec-dl@latest
 
       - name: Upload to YouTube
+        if: steps.recordings.outputs.found == 'true'
         env:
           YOUTUBE_CLIENT_ID: ${{ secrets.YOUTUBE_CLIENT_ID }}
           YOUTUBE_CLIENT_SECRET: ${{ secrets.YOUTUBE_CLIENT_SECRET }}
@@ -41,5 +50,4 @@ jobs:
           ZOOM_ACCOUNT_ID: ${{ secrets.ZOOM_ACCOUNT_ID }}
           ZOOM_CLIENT_ID: ${{ secrets.ZOOM_CLIENT_ID }}
           ZOOM_CLIENT_SECRET: ${{ secrets.ZOOM_CLIENT_SECRET }}
-
         run: node upload.js
