@@ -60,14 +60,38 @@ function addDays(date, days) {
   return result;
 }
 
-async function getRecordingsForRange(token, from, to) {
+async function getAccountUsers(token) {
+  try {
+    const response = await axios.get(
+      "https://api.zoom.us/v2/users",
+      {
+        headers: {
+          Authorization: `Bearer ${token}`
+        },
+        params: {
+          page_size: 300,
+          status: "active"
+        }
+      }
+    );
+    return response.data.users || [];
+  } catch (error) {
+    console.error(
+      "[ERR] Zoom list users API error:",
+      error.response?.data || error.message
+    );
+    return [];
+  }
+}
+
+async function getRecordingsForUser(token, userId, from, to) {
   const recordings = [];
   let nextPageToken = "";
 
   do {
     try {
       const response = await axios.get(
-        `https://api.zoom.us/v2/accounts/${encodeURIComponent(ACCOUNT_ID)}/recordings`,
+        `https://api.zoom.us/v2/users/${encodeURIComponent(userId)}/recordings`,
         {
           headers: {
             Authorization: `Bearer ${token}`
@@ -85,11 +109,7 @@ async function getRecordingsForRange(token, from, to) {
       recordings.push(...meetings);
       nextPageToken = response.data.next_page_token || "";
     } catch (error) {
-      console.error(
-        "[ERR] Zoom account recordings API error:",
-        error.response?.data || error.message
-      );
-      process.exit(1);
+      break;
     }
   } while (nextPageToken);
 
@@ -149,28 +169,33 @@ async function main() {
   const token = await getZoomAccessToken();
   console.error("[OK] Zoom authentication successful.");
 
+  const users = await getAccountUsers(token);
+  console.error(`[OK] Found ${users.length} users in account.`);
+
   const today = new Date();
   const startDate = addDays(today, -HISTORY_DAYS);
   const allRecordings = [];
 
-  let current = startDate;
+  for (const user of users) {
+    let current = startDate;
+    while (current <= today) {
+      const rangeEnd = new Date(
+        Math.min(
+          addDays(current, 29).getTime(),
+          today.getTime()
+        )
+      );
 
-  while (current <= today) {
-    const rangeEnd = new Date(
-      Math.min(
-        addDays(current, 29).getTime(),
-        today.getTime()
-      )
-    );
+      const recordings = await getRecordingsForUser(
+        token,
+        user.id,
+        current,
+        rangeEnd
+      );
 
-    const recordings = await getRecordingsForRange(
-      token,
-      current,
-      rangeEnd
-    );
-
-    allRecordings.push(...recordings);
-    current = addDays(rangeEnd, 1);
+      allRecordings.push(...recordings);
+      current = addDays(rangeEnd, 1);
+    }
   }
 
   const unique = new Map();
