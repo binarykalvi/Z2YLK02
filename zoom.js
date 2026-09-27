@@ -16,6 +16,8 @@ if (!ACCOUNT_ID || !CLIENT_ID || !CLIENT_SECRET) {
 
 async function getZoomAccessToken() {
   try {
+    const credentials = Buffer.from(`${CLIENT_ID}:${CLIENT_SECRET}`).toString("base64");
+
     const body = new URLSearchParams({
       grant_type: "account_credentials",
       account_id: ACCOUNT_ID
@@ -26,11 +28,8 @@ async function getZoomAccessToken() {
       body,
       {
         headers: {
-          "Content-Type": "application/x-www-form-urlencoded"
-        },
-        auth: {
-          username: CLIENT_ID,
-          password: CLIENT_SECRET
+          "Content-Type": "application/x-www-form-urlencoded",
+          "Authorization": `Basic ${credentials}`
         }
       }
     );
