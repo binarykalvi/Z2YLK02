@@ -1,183 +1,326 @@
 const fs = require('fs');
 const axios = require('axios');
 
-const ACCOUNT_ID = process.env.ZOOM_ACCOUNT_ID;
-const CLIENT_ID = process.env.ZOOM_CLIENT_ID;
-const CLIENT_SECRET = process.env.ZOOM_CLIENT_SECRET;
+const ACCOUNT_ID =
+  process.env.ZOOM_ACCOUNT_ID;
 
-const WEBINAR_ID =
-  process.env.ZOOM_WEBINAR_ID ||
-  extractWebinarId(process.env.ZOOM_URL);
+const CLIENT_ID =
+  process.env.ZOOM_CLIENT_ID;
 
-function extractWebinarId(url) {
-  if (!url) return null;
+const CLIENT_SECRET =
+  process.env.ZOOM_CLIENT_SECRET;
 
-  const matches = url.match(/\d{8,}/g);
+const API =
+  'https://api.zoom.us/v2';
 
-  if (!matches || matches.length === 0) {
-    return null;
-  }
-
-  return matches[matches.length - 1];
-}
-
-if (!ACCOUNT_ID || !CLIENT_ID || !CLIENT_SECRET) {
-  console.error('[ERR] Missing Zoom OAuth secrets.');
-  process.exit(1);
-}
-
-if (!WEBINAR_ID) {
-  console.error('[ERR] No webinar ID found.');
+if (
+  !ACCOUNT_ID ||
+  !CLIENT_ID ||
+  !CLIENT_SECRET
+) {
   console.error(
-    '[ERR] Send webinar_id in client_payload.'
+    '[ERR] Missing Zoom credentials.'
   );
+
   process.exit(1);
 }
 
-async function getZoomAccessToken() {
-  const credentials = Buffer
-    .from(`${CLIENT_ID}:${CLIENT_SECRET}`)
-    .toString('base64');
+// ============================================================
+// ZOOM OAUTH
+// ============================================================
 
-  const response = await axios.post(
-    'https://zoom.us/oauth/token',
+async function getAccessToken() {
+  const credentials =
+    Buffer
+      .from(
+        `${CLIENT_ID}:${CLIENT_SECRET}`
+      )
+      .toString('base64');
 
-    new URLSearchParams({
-      grant_type: 'account_credentials',
-      account_id: ACCOUNT_ID
-    }).toString(),
+  const response =
+    await axios.post(
+      'https://zoom.us/oauth/token',
 
-    {
-      headers: {
-        Authorization: `Basic ${credentials}`,
-        'Content-Type':
-          'application/x-www-form-urlencoded'
+      new URLSearchParams({
+        grant_type:
+          'account_credentials',
+
+        account_id:
+          ACCOUNT_ID
+      }).toString(),
+
+      {
+        headers: {
+          Authorization:
+            `Basic ${credentials}`,
+
+          'Content-Type':
+            'application/x-www-form-urlencoded'
+        }
       }
-    }
-  );
+    );
 
   return response.data.access_token;
 }
 
-async function getWebinar(accessToken) {
-  const response = await axios.get(
-    `https://api.zoom.us/v2/webinars/${WEBINAR_ID}`,
-    {
-      headers: {
-        Authorization:
-          `Bearer ${accessToken}`
-      }
-    }
+// ============================================================
+// DATE HELPERS
+// ============================================================
+
+function formatDate(date) {
+  return date
+    .toISOString()
+    .slice(0, 10);
+}
+
+function addDays(date, days) {
+  const result =
+    new Date(date);
+
+  result.setUTCDate(
+    result.getUTCDate() + days
   );
 
-  return response.data;
+  return result;
 }
 
-async function getRecording(accessToken) {
-  const response = await axios.get(
-    `https://api.zoom.us/v2/webinars/${WEBINAR_ID}/recordings`,
-    {
-      headers: {
-        Authorization:
-          `Bearer ${accessToken}`
-      }
+// ============================================================
+// GET RECORDINGS FOR DATE RANGE
+// ============================================================
+
+async function getRecordings(
+  accessToken,
+  from,
+  to
+) {
+  const recordings = [];
+
+  let nextPageToken = '';
+
+  do {
+    const params = {
+      from,
+      to,
+      page_size: 300
+    };
+
+    if (nextPageToken) {
+      params.next_page_token =
+        nextPageToken;
     }
-  );
 
-  return response.data;
+    const response =
+      await axios.get(
+        `${API}/accounts/${ACCOUNT_ID}/recordings`,
+        {
+          headers: {
+            Authorization:
+              `Bearer ${accessToken}`
+          },
+
+          params
+        }
+      );
+
+    const meetings =
+      response.data.meetings || [];
+
+    recordings.push(
+      ...meetings
+    );
+
+    nextPageToken =
+      response.data.next_page_token ||
+      '';
+
+  } while (nextPageToken);
+
+  return recordings;
 }
 
-function formatDate(dateString, timezone) {
-  const date = new Date(dateString);
-
-  if (Number.isNaN(date.getTime())) {
-    return dateString;
-  }
-
-  return new Intl.DateTimeFormat('en-GB', {
-    timeZone: timezone || 'UTC',
-    year: 'numeric',
-    month: '2-digit',
-    day: '2-digit',
-    hour: '2-digit',
-    minute: '2-digit',
-    hour12: false
-  }).format(date);
-}
+// ============================================================
+// MAIN
+// ============================================================
 
 async function main() {
   try {
     const accessToken =
-      await getZoomAccessToken();
+      await getAccessToken();
 
-    const webinar =
-      await getWebinar(accessToken);
+    /*
+     * Search a large historical window.
+     *
+     * Zoom's recording APIs have date-range
+     * limitations, so we search in small chunks.
+     *
+     * Change HISTORY_DAYS if you want more/less.
+     */
 
-    const recording =
-      await getRecording(accessToken);
+    const HISTORY_DAYS = 365;
 
-    if (
-      !recording ||
-      !recording.share_url
-    ) {
-      console.error(
-        '[ERR] No cloud recording available.'
+    const today =
+      new Date();
+
+    const firstDate =
+      addDays(
+        today,
+        -HISTORY_DAYS
       );
 
-      process.exit(1);
+    const allRecordings = [];
+
+    let current =
+      firstDate;
+
+    while (
+      current < today
+    ) {
+      const rangeEnd =
+        addDays(
+          current,
+          30
+        );
+
+      const end =
+        rangeEnd > today
+          ? today
+          : rangeEnd;
+
+      const from =
+        formatDate(current);
+
+      const to =
+        formatDate(end);
+
+      const recordings =
+        await getRecordings(
+          accessToken,
+          from,
+          to
+        );
+
+      allRecordings.push(
+        ...recordings
+      );
+
+      current =
+        addDays(
+          end,
+          1
+        );
     }
 
-    const recordingFiles =
-      recording.recording_files || [];
+    // ========================================================
+    // REMOVE DUPLICATES
+    // ========================================================
 
-    const completedFiles =
-      recordingFiles.filter(
-        file => file.status === 'completed'
+    const unique =
+      new Map();
+
+    for (
+      const recording
+      of allRecordings
+    ) {
+      const key =
+        `${recording.id}-${recording.uuid || ''}`;
+
+      unique.set(
+        key,
+        recording
+      );
+    }
+
+    const recordings =
+      Array.from(
+        unique.values()
       );
 
-    if (completedFiles.length === 0) {
-      console.error(
-        '[ERR] Recording files are not completed yet.'
+    // ========================================================
+    // ONLY RECORDINGS THAT HAVE FILES
+    // ========================================================
+
+    const ready =
+      recordings.filter(
+        recording => {
+          const files =
+            recording.recording_files ||
+            [];
+
+          return files.some(
+            file =>
+              file.status ===
+              'completed'
+          );
+        }
       );
 
-      process.exit(1);
+    // ========================================================
+    // WRITE URLS + METADATA
+    // ========================================================
+
+    const urls = [];
+
+    const metadata = [];
+
+    for (
+      const recording
+      of ready
+    ) {
+      if (
+        !recording.share_url
+      ) {
+        continue;
+      }
+
+      urls.push(
+        recording.share_url
+      );
+
+      metadata.push({
+        id:
+          String(
+            recording.id
+          ),
+
+        uuid:
+          recording.uuid ||
+          null,
+
+        topic:
+          recording.topic ||
+          'Cloud Recording',
+
+        start_time:
+          recording.start_time ||
+          null,
+
+        host_id:
+          recording.host_id ||
+          null,
+
+        type:
+          recording.type ||
+          null,
+
+        share_url:
+          recording.share_url,
+
+        recording_files:
+          recording.recording_files ||
+          []
+      });
     }
 
     fs.writeFileSync(
       'urls.txt',
-      `${recording.share_url}\n`,
+      urls.length
+        ? `${urls.join('\n')}\n`
+        : '',
       'utf8'
     );
 
-    const metadata = {
-      webinarId: String(WEBINAR_ID),
-
-      title:
-        webinar.topic ||
-        recording.topic ||
-        'Cloud Recording',
-
-      startTime:
-        webinar.start_time ||
-        recording.start_time,
-
-      timezone:
-        webinar.timezone ||
-        'UTC',
-
-      formattedDate:
-        formatDate(
-          webinar.start_time ||
-          recording.start_time,
-          webinar.timezone
-        ),
-
-      shareUrl:
-        recording.share_url
-    };
-
     fs.writeFileSync(
-      'zoom-metadata.json',
+      'zoom-recordings.json',
       JSON.stringify(
         metadata,
         null,
