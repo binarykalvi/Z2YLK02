@@ -1,553 +1,592 @@
-const fs = require('fs');
-const path = require('path');
-const axios = require('axios');
-const { google } = require('googleapis');
+const fs = require("fs");
+const path = require("path");
+const axios = require("axios");
+const { pipeline } = require("stream/promises");
+const { google } = require("googleapis");
 
-const OAuth2 =
-  google.auth.OAuth2;
+const ZOOM_ACCOUNT_ID = process.env.ZOOM_ACCOUNT_ID;
+const ZOOM_CLIENT_ID = process.env.ZOOM_CLIENT_ID;
+const ZOOM_CLIENT_SECRET = process.env.ZOOM_CLIENT_SECRET;
 
-// ============================================================
-// ENV
-// ============================================================
-
-const youtubeClientId =
+const YOUTUBE_CLIENT_ID =
   process.env.YOUTUBE_CLIENT_ID;
 
-const youtubeClientSecret =
+const YOUTUBE_CLIENT_SECRET =
   process.env.YOUTUBE_CLIENT_SECRET;
 
-const youtubeRefreshToken =
+const YOUTUBE_REFRESH_TOKEN =
   process.env.YOUTUBE_REFRESH_TOKEN;
 
-const zoomAccountId =
-  process.env.ZOOM_ACCOUNT_ID;
+const VIDEO_VISIBILITY =
+  process.env.VIDEO_VISIBILITY || "unlisted";
 
-const zoomClientId =
-  process.env.ZOOM_CLIENT_ID;
+const ZOOM_TIMEZONE =
+  process.env.ZOOM_TIMEZONE || "UTC";
 
-const zoomClientSecret =
-  process.env.ZOOM_CLIENT_SECRET;
+const RECORDINGS_FILE =
+  "zoom-recordings.json";
 
-const privacyStatus =
-  process.env.VIDEO_VISIBILITY ||
-  'unlisted';
-
-// ============================================================
-// LOAD METADATA
-// ============================================================
+const DOWNLOAD_DIR =
+  path.join(process.cwd(), "zoom-downloads");
 
 if (
-  !fs.existsSync(
-    'zoom-recordings.json'
-  )
+  !ZOOM_ACCOUNT_ID ||
+  !ZOOM_CLIENT_ID ||
+  !ZOOM_CLIENT_SECRET
 ) {
   console.error(
-    '[ERR] zoom-recordings.json not found.'
+    "[ERR] Missing Zoom credentials."
   );
-
   process.exit(1);
 }
 
-const zoomRecordings =
-  JSON.parse(
-    fs.readFileSync(
-      'zoom-recordings.json',
-      'utf8'
-    )
+if (
+  !YOUTUBE_CLIENT_ID ||
+  !YOUTUBE_CLIENT_SECRET ||
+  !YOUTUBE_REFRESH_TOKEN
+) {
+  console.error(
+    "[ERR] Missing YouTube credentials."
   );
+  process.exit(1);
+}
 
-// ============================================================
-// YOUTUBE AUTH
-// ============================================================
+function safeFileName(value) {
+  return String(value)
+    .replace(/[<>:"/\\|?*\x00-\x1F]/g, "_")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, 150);
+}
 
-const oauth2Client =
-  new OAuth2(
-    youtubeClientId,
-    youtubeClientSecret,
-    'https://developers.google.com/oauthplayground'
+function formatRecordingDate(startTime) {
+  if (!startTime) {
+    return "Unknown Date";
+  }
+
+  try {
+    const date = new Date(startTime);
+
+    return new Intl.DateTimeFormat(
+      "en-CA",
+      {
+        timeZone: ZOOM_TIMEZONE,
+        year: "numeric",
+        month: "2-digit",
+        day: "2-digit"
+      }
+    ).format(date);
+  } catch {
+    return startTime.slice(0, 10);
+  }
+}
+
+function getFileName(file) {
+  return (
+    file.file_name ||
+    file.file_path ||
+    `${file.id || Date.now()}.mp4`
   );
+}
 
-oauth2Client.setCredentials({
-  refresh_token:
-    youtubeRefreshToken
-});
+function getGroupKey(file) {
+  if (file.recording_start) {
+    return file.recording_start;
+  }
 
-const youtube =
-  google.youtube({
-    version: 'v3',
-    auth: oauth2Client
+  const name = getFileName(file);
+
+  const gmtMatch =
+    name.match(/GMT\d+-\d+/i);
+
+  if (gmtMatch) {
+    return gmtMatch[0];
+  }
+
+  return file.id || name;
+}
+
+function fileScore(file) {
+  const name =
+    getFileName(file).toLowerCase();
+
+  let score = 0;
+
+  if (name.includes("1280x720")) {
+    score += 1000000000;
+  }
+
+  if (name.includes("_avo_")) {
+    score -= 100000000;
+  }
+
+  if (name.includes("_as_")) {
+    score -= 10000000;
+  }
+
+  score += Number(file.file_size || 0);
+
+  return score;
+}
+
+function selectVideoFiles(recording) {
+  const files = Array.isArray(
+    recording.recording_files
+  )
+    ? recording.recording_files
+    : [];
+
+  const mp4Files = files.filter((file) => {
+    const type = String(
+      file.file_type || ""
+    ).toUpperCase();
+
+    const extension = String(
+      file.file_extension || ""
+    ).toUpperCase();
+
+    return (
+      file.status === "completed" &&
+      Boolean(file.download_url) &&
+      (type === "MP4" ||
+        extension === "MP4")
+    );
   });
 
-// ============================================================
-// FIND MP4
-// ============================================================
+  const groups = new Map();
 
-function getAllMp4Files(
-  dir,
-  fileList = []
-) {
-  const items =
-    fs.readdirSync(
-      dir,
+  for (const file of mp4Files) {
+    const key = getGroupKey(file);
+
+    if (!groups.has(key)) {
+      groups.set(key, []);
+    }
+
+    groups.get(key).push(file);
+  }
+
+  const selected = [];
+
+  for (const filesInGroup of groups.values()) {
+    filesInGroup.sort(
+      (a, b) =>
+        fileScore(b) -
+        fileScore(a)
+    );
+
+    selected.push(
+      filesInGroup[0]
+    );
+  }
+
+  selected.sort((a, b) => {
+    const aTime =
+      new Date(
+        a.recording_start || 0
+      ).getTime();
+
+    const bTime =
+      new Date(
+        b.recording_start || 0
+      ).getTime();
+
+    return aTime - bTime;
+  });
+
+  return selected;
+}
+
+async function getZoomAccessToken() {
+  try {
+    const body = new URLSearchParams({
+      grant_type: "account_credentials",
+      account_id: ZOOM_ACCOUNT_ID
+    }).toString();
+
+    const response = await axios.post(
+      "https://zoom.us/oauth/token",
+      body,
       {
-        withFileTypes: true
+        headers: {
+          "Content-Type":
+            "application/x-www-form-urlencoded"
+        },
+        auth: {
+          username: ZOOM_CLIENT_ID,
+          password: ZOOM_CLIENT_SECRET
+        }
       }
     );
 
-  for (
-    const item of items
-  ) {
-    const fullPath =
-      path.join(
-        dir,
-        item.name
-      );
-
-    if (
-      item.isDirectory() &&
-      item.name !==
-        'node_modules' &&
-      !item.name.startsWith('.')
-    ) {
-      getAllMp4Files(
-        fullPath,
-        fileList
-      );
-    } else if (
-      item.isFile() &&
-      item.name
-        .toLowerCase()
-        .endsWith('.mp4')
-    ) {
-      fileList.push(
-        fullPath
-      );
-    }
-  }
-
-  return fileList;
-}
-
-// ============================================================
-// FORMAT DATE
-// ============================================================
-
-function formatRecordingDate(
-  dateString
-) {
-  if (!dateString) {
-    return 'Unknown Date';
-  }
-
-  const date =
-    new Date(dateString);
-
-  if (
-    Number.isNaN(
-      date.getTime()
-    )
-  ) {
-    return dateString;
-  }
-
-  return new Intl.DateTimeFormat(
-    'en-GB',
-    {
-      year: 'numeric',
-      month: '2-digit',
-      day: '2-digit',
-      hour: '2-digit',
-      minute: '2-digit',
-      hour12: false,
-      timeZone: 'UTC'
-    }
-  ).format(date);
-}
-
-// ============================================================
-// FIND BEST MP4
-// ============================================================
-
-function chooseBestFiles(
-  files
-) {
-  const mp4 =
-    files.filter(
-      file =>
-        file
-          .toLowerCase()
-          .endsWith('.mp4')
+    return response.data.access_token;
+  } catch (error) {
+    console.error(
+      "[ERR] Zoom authentication failed:",
+      error.response?.data ||
+        error.message
     );
 
-  if (
-    mp4.length === 0
-  ) {
-    return [];
+    throw error;
   }
-
-  if (
-    mp4.length === 1
-  ) {
-    return mp4;
-  }
-
-  const selected =
-    mp4.filter(
-      file =>
-        file.includes(
-          '1280x720'
-        ) &&
-        !file.includes(
-          '_as_'
-        ) &&
-        !file.includes(
-          '_avo_'
-        )
-    );
-
-  if (
-    selected.length
-  ) {
-    return selected;
-  }
-
-  return mp4;
 }
 
-// ============================================================
-// YOUTUBE TITLE
-// ============================================================
-
-function makeTitle(
-  recording,
-  part,
-  total
-) {
-  const topic =
-    recording.topic ||
-    'Cloud Recording';
-
-  const date =
-    formatRecordingDate(
-      recording.start_time
-    );
-
-  let title =
-    `Cloud Recording - ${topic} - ${date}`;
-
-  if (
-    total > 1
-  ) {
-    title +=
-      ` - Part ${part}/${total}`;
-  }
-
-  return title;
-}
-
-// ============================================================
-// DESCRIPTION
-// ============================================================
-
-function makeDescription(
-  recording
-) {
-  return [
-    `Cloud Recording`,
-    `Title: ${recording.topic || 'Cloud Recording'}`,
-    `Recording Date: ${formatRecordingDate(recording.start_time)}`,
-    `Zoom Recording: ${recording.share_url}`,
-    '',
-    'Uploaded automatically by Z2YLK02.'
-  ].join('\n');
-}
-
-// ============================================================
-// UPLOAD
-// ============================================================
-
-async function uploadVideo(
+async function downloadZoomFile(
   file,
+  destination
+) {
+  let token =
+    await getZoomAccessToken();
+
+  try {
+    const response =
+      await axios.get(
+        file.download_url,
+        {
+          headers: {
+            Authorization:
+              `Bearer ${token}`
+          },
+          responseType: "stream"
+        }
+      );
+
+    await pipeline(
+      response.data,
+      fs.createWriteStream(
+        destination
+      )
+    );
+
+    return;
+  } catch (error) {
+    if (
+      error.response?.status !== 401
+    ) {
+      throw error;
+    }
+  }
+
+  token =
+    await getZoomAccessToken();
+
+  const response =
+    await axios.get(
+      file.download_url,
+      {
+        headers: {
+          Authorization:
+            `Bearer ${token}`
+        },
+        responseType: "stream"
+      }
+    );
+
+  await pipeline(
+    response.data,
+    fs.createWriteStream(
+      destination
+    )
+  );
+}
+
+function createYouTubeClient() {
+  const oauth2Client =
+    new google.auth.OAuth2(
+      YOUTUBE_CLIENT_ID,
+      YOUTUBE_CLIENT_SECRET
+    );
+
+  oauth2Client.setCredentials({
+    refresh_token:
+      YOUTUBE_REFRESH_TOKEN
+  });
+
+  return google.youtube({
+    version: "v3",
+    auth: oauth2Client
+  });
+}
+
+async function uploadToYouTube(
+  youtube,
+  filePath,
   title,
   description
 ) {
   const response =
     await youtube.videos.insert({
-      part:
-        'snippet,status',
-
+      part: [
+        "snippet",
+        "status"
+      ],
       requestBody: {
         snippet: {
           title,
           description,
-          categoryId:
-            '22'
+          categoryId: "22"
         },
-
         status: {
-          privacyStatus
+          privacyStatus:
+            VIDEO_VISIBILITY,
+          selfDeclaredMadeForKids:
+            false
         }
       },
-
       media: {
-        body:
-          fs.createReadStream(
-            file
-          )
+        body: fs.createReadStream(
+          filePath
+        )
       }
     });
 
-  if (
-    !response.data ||
-    !response.data.id
-  ) {
+  if (!response.data.id) {
     throw new Error(
-      'YouTube upload did not return a video ID.'
+      "YouTube upload completed without returning a video ID."
     );
   }
 
   return response.data.id;
 }
 
-// ============================================================
-// ZOOM TOKEN
-// ============================================================
+async function deleteZoomRecording(
+  meetingId
+) {
+  if (!meetingId) {
+    throw new Error(
+      "Zoom meeting ID is missing."
+    );
+  }
 
-async function getZoomToken() {
-  const credentials =
-    Buffer
-      .from(
-        `${zoomClientId}:${zoomClientSecret}`
-      )
-      .toString('base64');
+  const token =
+    await getZoomAccessToken();
 
-  const response =
-    await axios.post(
-      'https://zoom.us/oauth/token',
-
-      new URLSearchParams({
-        grant_type:
-          'account_credentials',
-
-        account_id:
-          zoomAccountId
-      }).toString(),
-
+  try {
+    await axios.delete(
+      `https://api.zoom.us/v2/meetings/${encodeURIComponent(
+        meetingId
+      )}/recordings`,
       {
         headers: {
           Authorization:
-            `Basic ${credentials}`,
-
-          'Content-Type':
-            'application/x-www-form-urlencoded'
+            `Bearer ${token}`
         }
       }
     );
+  } catch (error) {
+    console.error(
+      "[ERR] Zoom recording deletion failed:",
+      error.response?.data ||
+        error.message
+    );
 
-  return response.data.access_token;
+    throw error;
+  }
 }
 
-// ============================================================
-// DELETE ZOOM RECORDING
-// ============================================================
-
-async function deleteZoomRecording(
-  recording
+async function processRecording(
+  youtube,
+  recording,
+  index,
+  total
 ) {
-  const token =
-    await getZoomToken();
+  const files =
+    selectVideoFiles(recording);
 
-  await axios.delete(
-    `https://api.zoom.us/v2/meetings/${encodeURIComponent(recording.id)}/recordings`,
-    {
-      headers: {
-        Authorization:
-          `Bearer ${token}`
-      }
+  if (files.length === 0) {
+    console.error(
+      `[SKIP] No completed MP4 files for recording ${recording.meeting_id}.`
+    );
+
+    return;
+  }
+
+  const topic =
+    recording.topic ||
+    "Untitled Zoom Recording";
+
+  const recordingDate =
+    formatRecordingDate(
+      recording.start_time
+    );
+
+  const baseTitle =
+    `Cloud Recording - ${topic} - ${recordingDate}`;
+
+  console.error(
+    `[INFO] Processing recording ${index}/${total}: ${topic}`
+  );
+
+  console.error(
+    `[INFO] Selected video files: ${files.length}`
+  );
+
+  const uploadedVideos = [];
+
+  for (
+    let i = 0;
+    i < files.length;
+    i++
+  ) {
+    const file = files[i];
+
+    const partTitle =
+      files.length > 1
+        ? `${baseTitle} - Part ${i + 1}/${files.length}`
+        : baseTitle;
+
+    const localName =
+      `${String(index).padStart(4, "0")}-${String(
+        i + 1
+      ).padStart(2, "0")}-${safeFileName(
+        topic
+      )}.mp4`;
+
+    const localPath =
+      path.join(
+        DOWNLOAD_DIR,
+        localName
+      );
+
+    console.error(
+      `[INFO] Downloading part ${i + 1}/${files.length}`
+    );
+
+    await downloadZoomFile(
+      file,
+      localPath
+    );
+
+    const description =
+      `Zoom Cloud Recording\n\n` +
+      `Topic: ${topic}\n` +
+      `Recording date: ${recordingDate}\n` +
+      `Zoom meeting ID: ${recording.meeting_id}\n` +
+      `${
+        recording.share_url
+          ? `Zoom recording: ${recording.share_url}\n`
+          : ""
+      }`;
+
+    console.error(
+      `[INFO] Uploading to YouTube: ${partTitle}`
+    );
+
+    const youtubeVideoId =
+      await uploadToYouTube(
+        youtube,
+        localPath,
+        partTitle,
+        description
+      );
+
+    uploadedVideos.push(
+      youtubeVideoId
+    );
+
+    console.error(
+      `[OK] YouTube upload successful: ${youtubeVideoId}`
+    );
+
+    if (fs.existsSync(localPath)) {
+      fs.unlinkSync(localPath);
     }
+  }
+
+  if (
+    uploadedVideos.length !==
+    files.length
+  ) {
+    throw new Error(
+      "Not all recording files were uploaded. Zoom recording will not be deleted."
+    );
+  }
+
+  console.error(
+    `[INFO] All YouTube uploads succeeded for Zoom recording ${recording.meeting_id}.`
+  );
+
+  console.error(
+    `[INFO] Deleting Zoom recording ${recording.meeting_id}.`
+  );
+
+  await deleteZoomRecording(
+    recording.meeting_id
+  );
+
+  console.error(
+    `[OK] Zoom recording deleted: ${recording.meeting_id}`
   );
 }
 
-// ============================================================
-// MAIN
-// ============================================================
-
 async function main() {
-  const mp4Files =
-    getAllMp4Files(
-      process.cwd()
+  if (
+    !fs.existsSync(
+      RECORDINGS_FILE
+    )
+  ) {
+    console.error(
+      `[ERR] ${RECORDINGS_FILE} was not created.`
     );
 
-  /*
-   * No MP4 files means nothing was downloaded.
-   * This is a successful "nothing to do" situation.
-   */
+    process.exit(1);
+  }
+
+  const recordings =
+    JSON.parse(
+      fs.readFileSync(
+        RECORDINGS_FILE,
+        "utf8"
+      )
+    );
 
   if (
-    mp4Files.length === 0
+    !Array.isArray(recordings) ||
+    recordings.length === 0
   ) {
-    process.exit(0);
-  }
-
-  /*
-   * We need to map downloaded files back to
-   * recordings. zoom-rec-dl normally preserves
-   * the recording naming information.
-   *
-   * Process recordings sequentially.
-   */
-
-  let fileIndex = 0;
-
-  for (
-    const recording
-    of zoomRecordings
-  ) {
-    const recordingFiles =
-      chooseBestFiles(
-        mp4Files.slice(
-          fileIndex
-        )
-      );
-
-    if (
-      recordingFiles.length === 0
-    ) {
-      continue;
-    }
-
-    /*
-     * Upload files belonging to this recording.
-     */
-
-    const uploaded = [];
-
-    try {
-      for (
-        let i = 0;
-        i < recordingFiles.length;
-        i++
-      ) {
-        const file =
-          recordingFiles[i];
-
-        const title =
-          makeTitle(
-            recording,
-            i + 1,
-            recordingFiles.length
-          );
-
-        const description =
-          makeDescription(
-            recording
-          );
-
-        const videoId =
-          await uploadVideo(
-            file,
-            title,
-            description
-          );
-
-        uploaded.push({
-          file,
-          videoId
-        });
-      }
-    } catch (error) {
-      console.error(
-        '[ERR] YouTube upload failed:',
-        error.response?.data ||
-        error.message ||
-        error
-      );
-
-      /*
-       * IMPORTANT:
-       *
-       * Do NOT delete Zoom recording
-       * if YouTube upload failed.
-       */
-
-      process.exit(1);
-    }
-
-    /*
-     * All files for this recording
-     * successfully uploaded.
-     */
-
-    try {
-      await deleteZoomRecording(
-        recording
-      );
-    } catch (error) {
-      console.error(
-        '[ERR] Could not delete Zoom recording:',
-        error.response?.data ||
-        error.message
-      );
-
-      /*
-       * YouTube upload succeeded,
-       * but Zoom deletion failed.
-       *
-       * Do not pretend deletion happened.
-       */
-
-      process.exit(1);
-    }
-
-    /*
-     * Delete local files after
-     * successful YouTube + Zoom processing.
-     */
-
-    for (
-      const item of uploaded
-    ) {
-      if (
-        fs.existsSync(
-          item.file
-        )
-      ) {
-        fs.unlinkSync(
-          item.file
-        );
-      }
-    }
-
-    fileIndex +=
-      recordingFiles.length;
-  }
-
-  /*
-   * Remove any remaining MP4 files.
-   */
-
-  const remaining =
-    getAllMp4Files(
-      process.cwd()
+    console.error(
+      "[OK] No Zoom recordings to process."
     );
 
-  for (
-    const file of remaining
-  ) {
-    if (
-      fs.existsSync(file)
-    ) {
-      fs.unlinkSync(file);
-    }
+    return;
   }
+
+  fs.mkdirSync(
+    DOWNLOAD_DIR,
+    {
+      recursive: true
+    }
+  );
+
+  const youtube =
+    createYouTubeClient();
+
+  console.error(
+    `[INFO] Total recordings to process: ${recordings.length}`
+  );
+
+  for (
+    let i = 0;
+    i < recordings.length;
+    i++
+  ) {
+    await processRecording(
+      youtube,
+      recordings[i],
+      i + 1,
+      recordings.length
+    );
+  }
+
+  console.error(
+    "[OK] All Zoom recordings processed successfully."
+  );
 }
 
-main().catch(error => {
+main().catch((error) => {
   console.error(
-    '[FATAL]',
+    "[ERR] Processing failed:",
     error.response?.data ||
-    error.message ||
-    error
+      error.message
   );
 
   process.exit(1);
