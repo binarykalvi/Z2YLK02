@@ -66,9 +66,8 @@ async function getRecordingsForRange(token, from, to) {
 
   do {
     try {
-      // Using 'me' fetches recordings for the account owner/principal user authorized by the Server-to-Server app
       const response = await axios.get(
-        "https://api.zoom.us/v2/users/me/recordings",
+        `https://api.zoom.us/v2/accounts/${encodeURIComponent(ACCOUNT_ID)}/recordings`,
         {
           headers: {
             Authorization: `Bearer ${token}`
@@ -87,7 +86,7 @@ async function getRecordingsForRange(token, from, to) {
       nextPageToken = response.data.next_page_token || "";
     } catch (error) {
       console.error(
-        "[ERR] Zoom recordings API error:",
+        "[ERR] Zoom account recordings API error:",
         error.response?.data || error.message
       );
       process.exit(1);
